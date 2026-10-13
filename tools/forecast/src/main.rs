@@ -1,6 +1,6 @@
 //! The forecast ribbon for the ESP32-C3 1.47" LCD: renders it and pushes it to the board over Wi-Fi.
 //!
-//! The ribbon: eight days running down the 172×320 panel, the last 24 h above a "now" line and 7 days ahead below it, rolling upward one pixel row per period (~37.6 min). Temperature (green), wind (red, log 1–64 mph) and relative humidity (blue) are solid fills from the left, added together; temperature (°F) and humidity (%) share one 0–100 axis, labelled in yellow along the top. Day names in the left margin, at local midnights (daylight-saving changes included).
+//! The ribbon: eight days running down the 172×320 panel, the last 24 h above a "now" line and 7 days ahead below it, rolling upward one pixel row per period (~37.6 min). Temperature (green), wind (red, log 1–64 mph) and relative humidity (blue) are solid fills from the left, added together; temperature (°F) and humidity (%) share one 0–100 axis, labelled along the top in cyan (their colours together). Day names in the left margin below the now line, at local midnights (daylight-saving changes included). Above it, the margin reads top down: the board's Wi-Fi signal as one dozenal digit (red Zil at −80 dBm or worse, through yellow, to green Stelor at −40 dBm or better), drawn by the board itself from cells sent with `g`, then humidity, temperature and wind now in their fills' colours.
 //!
 //! Everything is composited in linear light, fills, anti-aliased edges and text alike, then encoded to RGB565 through the panel's measured per-channel response (measurements/i1pro-2026-10-12/response.json, γ ≈ 2.78). The gridlines (every 10 on the 0–100 axis) and the now line are then applied to the codes themselves: (3v + !v) >> 2 and v ^ max.
 //!
@@ -33,6 +33,9 @@ const PX_PER_H: f64 = (H - RULER) as f64 / (PAST_H + FUTURE_H);
 /// Each period moves the ribbon up exactly one pixel row.
 const PERIOD_S: f64 = 3600.0 / PX_PER_H;
 const TOP: [u16; 3] = [31, 63, 31];
+/// The signal cell at the top-left, as the board has it: the margin's width, one reading row high.
+const CELL_W: usize = MARGIN;
+const CELL_H: usize = 13;
 
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -110,6 +113,35 @@ fn text(light: &mut [[f64; 3]], font: &FontRef, s: &str, (x, y): (f64, f64), siz
     }
 }
 
+/// The signal-strength digit for `rssi` (dBm), as the boards work it out: Zil at −80 or worse (or not connected) up to Stelor at −40 or better, evenly spaced in dB.
+fn signal_digit(rssi: Option<i32>) -> u8 {
+    rssi.map_or(0, |r| (((r + 80).clamp(0, 40) * 11 + 20) / 40) as u8)
+}
+
+/// The signal digit's colour, linear light: red at Zil, through yellow (red and green both full) at the middle, to green at Stelor.
+fn signal_colour(digit: u8) -> [f64; 3] {
+    let d = digit as f64 / 11.0;
+    [(2.0 * (1.0 - d)).min(1.0), (2.0 * d).min(1.0), 0.0]
+}
+
+/// The readings' rows in the margin above the now line: row `i`'s right-hand end and centre line. Row 0 is the signal cell.
+fn reading_at(i: usize) -> (f64, f64) {
+    (MARGIN as f64 - 2.0, CELL_H as f64 * (i as f64 + 0.5))
+}
+
+/// The cells the board draws over the frame's top-left corner for its own signal (its `g`): each dozenal digit Zil..Stelor in its colour on black, CELL_W × CELL_H, in digit order, rendered like the rest of the ribbon.
+fn signal_cells(enc: &Encoder, font: &FontRef) -> Vec<[u16; 3]> {
+    let mut out = Vec::with_capacity(12 * CELL_W * CELL_H);
+    for digit in 0..12u8 {
+        let mut light = vec![[0f64; 3]; W * H];
+        text(&mut light, font, &char::from_u32(0x10 + digit as u32).unwrap().to_string(), reading_at(0), 11.0, 1.0, signal_colour(digit));
+        for y in 0..CELL_H {
+            out.extend(light[y * W..y * W + CELL_W].iter().map(|p| [0, 1, 2].map(|c| enc.encode(c, p[c].clamp(0.0, 1.0)))));
+        }
+    }
+    out
+}
+
 /// The ribbon as RGB565 levels (red 0–31, green 0–63, blue 0–31), for `now` (unix seconds) already snapped to a period boundary.
 fn render(f: &Forecast, now: f64, enc: &Encoder, font: &FontRef) -> Vec<[u16; 3]> {
     let lane = W - MARGIN;
@@ -132,32 +164,45 @@ fn render(f: &Forecast, now: f64, enc: &Encoder, font: &FontRef) -> Vec<[u16; 3]
             }
         }
     }
-    let yellow = [1.0, 0.8, 0.0];
+    // Cyan, green and blue together: the axis belongs to temperature and humidity.
+    let cyan = [0.0, 0.8, 1.0];
     for v in (20..100).step_by(20) {
-        text(&mut light, font, &v.to_string(), (MARGIN as f64 + v as f64 / 100.0 * lane as f64, RULER as f64 - 8.0), 11.0, 0.5, yellow);
+        text(&mut light, font, &v.to_string(), (MARGIN as f64 + v as f64 / 100.0 * lane as f64, RULER as f64 - 8.0), 11.0, 0.5, cyan);
     }
     // Local midnights from the day before the window opens: a tick at each, the weekday centred on its day.
     let y_of = |t: f64| RULER as f64 + ((t - now) / 3600.0 + PAST_H) * PX_PER_H;
     let mut day = Local.timestamp_opt((now - PAST_H * 3600.0) as i64, 0).unwrap().date_naive();
     let midnight = |d: chrono::NaiveDate| Local.from_local_datetime(&d.and_hms_opt(0, 0, 0).unwrap()).earliest().unwrap().timestamp() as f64;
+    // Day ticks and names only below the now line: the margin above it holds the readings.
+    let top = y_of(now) + 1.0;
     let mut ticks = Vec::new();
     while y_of(midnight(day)) < H as f64 {
         let (y0, y1) = (y_of(midnight(day)), y_of(midnight(day.succ_opt().unwrap())));
-        if y0 >= RULER as f64 {
+        if y0 > y_of(now) {
             ticks.push(y0.round() as usize);
         }
-        if y1.min(H as f64) - y0.max(RULER as f64) > 12.0 {
-            text(&mut light, font, &day.format("%a").to_string(), (MARGIN as f64 - 7.0, (y0.max(RULER as f64) + y1.min(H as f64)) / 2.0), 11.0, 1.0, [0.55, 0.55, 0.6]);
+        if y1.min(H as f64) - y0.max(top) > 12.0 {
+            text(&mut light, font, &day.format("%a").to_string(), (MARGIN as f64 - 7.0, (y0.max(top) + y1.min(H as f64)) / 2.0), 11.0, 1.0, [0.55, 0.55, 0.6]);
         }
         day = day.succ_opt().unwrap();
     }
+    // The margin above the now line, top down: a row left black for the board's signal cell (`signal_cells`), then humidity, temperature and wind now, each in its fill's colour.
+    let now_at = |ys: &[f64]| interp(&f.t, ys, now);
+    let readings = [
+        (format!("{:.0}%", now_at(&f.humidity)), [0.0, 0.0, 1.0]),
+        (format!("{:.0}°", now_at(&f.temp)), [0.0, 1.0, 0.0]),
+        (format!("{:.0}", now_at(&f.wind)), [1.0, 0.0, 0.0]),
+    ];
+    for (i, (s, colour)) in readings.iter().enumerate() {
+        text(&mut light, font, s, reading_at(i + 1), 11.0, 1.0, *colour);
+    }
 
     let mut code: Vec<[u16; 3]> = light.iter().map(|p| [0, 1, 2].map(|c| enc.encode(c, p[c].clamp(0.0, 1.0)))).collect();
-    // Ruler ticks every 10 (longer at the labelled 20s) in yellow and the day ticks in grey: solid, on the codes.
+    // Ruler ticks every 10 (longer at the labelled 20s) in cyan and the day ticks in grey: solid, on the codes.
     let grid_x = |v: usize| MARGIN + (v as f64 / 100.0 * lane as f64 - 0.5).round() as usize;
     for v in (10..100).step_by(10) {
         for y in RULER - if v % 20 == 0 { 4 } else { 2 }..RULER {
-            code[y * W + grid_x(v)] = [31, 50, 0];
+            code[y * W + grid_x(v)] = [0, 50, 31];
         }
     }
     for &y in ticks.iter().filter(|&&y| y < H) {
@@ -206,26 +251,56 @@ fn preview(code: &[[u16; 3]], path: &str) {
     e.write_header().unwrap().write_image_data(&rgb).unwrap();
 }
 
-/// Authenticate with the shared key and send one frame; the board checks its BLAKE3 before drawing it.
-fn push(data: &[u8]) -> Result<(), String> {
-    let key: [u8; 32] = hex(std::fs::read_to_string(KEY).map_err(|e| e.to_string())?.trim()).ok_or("bad key file")?;
-    let stream = TcpStream::connect(HOST).map_err(|e| format!("connect: {e}"))?;
-    stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
-    let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
-    let mut w = stream;
-    let mut line = String::new();
-    reader.read_line(&mut line).map_err(|e| e.to_string())?;
-    let nonce: [u8; 32] = hex(line.split_whitespace().nth(1).ok_or("no challenge")?).ok_or("bad challenge")?;
-    writeln!(w, "auth {}", blake3::keyed_hash(&key, &nonce).to_hex()).map_err(|e| e.to_string())?;
-    line.clear();
-    reader.read_line(&mut line).map_err(|e| e.to_string())?;
-    if !line.starts_with("ok") {
-        return Err("auth refused".into());
+/// A connection to the board, past its challenge.
+struct Board {
+    reader: BufReader<TcpStream>,
+    w: TcpStream,
+}
+
+impl Board {
+    /// Connect and answer the challenge with the shared key.
+    fn connect() -> Result<Board, String> {
+        let key: [u8; 32] = hex(std::fs::read_to_string(KEY).map_err(|e| e.to_string())?.trim()).ok_or("bad key file")?;
+        let stream = TcpStream::connect(HOST).map_err(|e| format!("connect: {e}"))?;
+        stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
+        let mut board = Board { reader: BufReader::new(stream.try_clone().map_err(|e| e.to_string())?), w: stream };
+        let line = board.line()?;
+        let nonce: [u8; 32] = hex(line.split_whitespace().nth(1).ok_or("no challenge")?).ok_or("bad challenge")?;
+        writeln!(board.w, "auth {}", blake3::keyed_hash(&key, &nonce).to_hex()).map_err(|e| e.to_string())?;
+        if !board.line()?.starts_with("ok") {
+            return Err("auth refused".into());
+        }
+        Ok(board)
     }
-    w.write_all(format!("d {}\n", blake3::hash(data).to_hex()).as_bytes()).and_then(|_| w.write_all(data)).map_err(|e| e.to_string())?;
-    line.clear();
-    reader.read_line(&mut line).map_err(|e| e.to_string())?;
-    if line.starts_with("ok") { Ok(()) } else { Err(line.trim().to_string()) }
+
+    fn line(&mut self) -> Result<String, String> {
+        let mut line = String::new();
+        self.reader.read_line(&mut line).map_err(|e| e.to_string())?;
+        Ok(line)
+    }
+
+    /// The board's `info`: its Wi-Fi signal (dBm; None when it isn't connected) and the first 16 hex digits of its signal cells' BLAKE3 (`-` for none).
+    fn info(&mut self) -> Result<(Option<i32>, String), String> {
+        writeln!(self.w, "info").map_err(|e| e.to_string())?;
+        let line = self.line()?;
+        let field = |k: &str| line.split_whitespace().skip_while(|&w| w != k).nth(1).map(str::to_string);
+        Ok((field("rssi").and_then(|v| v.parse().ok()).filter(|&r| r != 0), field("cells").unwrap_or_default()))
+    }
+
+    /// Send `op hash` and `data`; the board checks the BLAKE3 before taking it.
+    fn send(&mut self, op: &str, data: &[u8]) -> Result<(), String> {
+        self.w.write_all(format!("{op} {}\n", blake3::hash(data).to_hex()).as_bytes()).and_then(|_| self.w.write_all(data)).map_err(|e| e.to_string())?;
+        let line = self.line()?;
+        if line.starts_with("ok") { Ok(()) } else { Err(line.trim().to_string()) }
+    }
+
+    /// Send the signal cells, unless the board holds these already. Whether they were sent.
+    fn cells(&mut self, data: &[u8]) -> Result<bool, String> {
+        if self.info()?.1 == blake3::hash(data).to_hex()[..16] {
+            return Ok(false);
+        }
+        self.send("g", data).map(|_| true)
+    }
 }
 
 fn hex(s: &str) -> Option<[u8; 32]> {
@@ -258,6 +333,7 @@ fn main() {
     let enc = Encoder::load();
     let ttf = std::fs::read(repo().join("assets/font/Oxanium-Regular+glyphs.ttf")).expect("font");
     let font = FontRef::try_from_slice(&ttf).expect("parse font");
+    let cells = signal_cells(&enc, &font);
     if arg.as_deref() == Some("run") {
         let mut forecast: Option<(Forecast, f64)> = None;
         loop {
@@ -265,7 +341,11 @@ fn main() {
                 if forecast.as_ref().is_none_or(|(_, at)| unix() - at > 3600.0) {
                     forecast = Some((fetch()?, unix()));
                 }
-                push(&to_bytes(&render(&forecast.as_ref().unwrap().0, snapped(), &enc, &font)))
+                let mut board = Board::connect()?;
+                if board.cells(&to_bytes(&cells))? {
+                    println!("{} signal cells sent", stamp());
+                }
+                board.send("d", &to_bytes(&render(&forecast.as_ref().unwrap().0, snapped(), &enc, &font)))
             })();
             match attempt {
                 Ok(()) => println!("{} pushed", stamp()),
@@ -279,13 +359,24 @@ fn main() {
             std::thread::sleep(Duration::from_secs_f64(PERIOD_S - unix() % PERIOD_S + 2.0));
         }
     }
-    let code = render(&fetch().expect("forecast"), snapped(), &enc, &font);
+    let mut code = render(&fetch().expect("forecast"), snapped(), &enc, &font);
     if arg.as_deref() == Some("--preview") {
+        // With the cell the board would draw over it now, if it can be asked.
+        let rssi = Board::connect().and_then(|mut b| b.info()).map_or(None, |(r, _)| r);
+        println!("signal: {}", rssi.map_or("unknown".to_string(), |r| format!("{r} dBm")));
+        let digit = signal_digit(rssi) as usize;
+        for y in 0..CELL_H {
+            code[y * W..y * W + CELL_W].copy_from_slice(&cells[(digit * CELL_H + y) * CELL_W..][..CELL_W]);
+        }
         std::fs::create_dir_all("/tmp/forecast-preview").unwrap();
         preview(&code, "/tmp/forecast-preview/panel.png");
         println!("/tmp/forecast-preview/panel.png");
     } else {
-        push(&to_bytes(&code)).expect("push");
+        let mut board = Board::connect().expect("connect");
+        if board.cells(&to_bytes(&cells)).expect("signal cells") {
+            println!("signal cells sent");
+        }
+        board.send("d", &to_bytes(&code)).expect("push");
         println!("pushed");
     }
 }

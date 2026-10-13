@@ -1,7 +1,7 @@
 //! Wi-Fi: join the stored network as an ordinary station, take an address by DHCP (asking for the name `forecast`), answer mDNS for `forecast.local`, and serve the command protocol over TCP on port 7766.
 
 use core::net::{Ipv4Addr, Ipv6Addr};
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
 use edge_mdns::buf::VecBufAccess;
 use edge_mdns::domain::base::Ttl;
@@ -38,6 +38,16 @@ pub fn address() -> Option<Ipv4Addr> {
     }
 }
 
+/// Signal strength of the joined network in dBm, from its beacons, sampled every few seconds while connected (0: not connected).
+static RSSI: AtomicI32 = AtomicI32::new(0);
+
+pub fn rssi() -> Option<i32> {
+    match RSSI.load(Ordering::Relaxed) {
+        0 => None,
+        r => Some(r),
+    }
+}
+
 /// Bring up Wi-Fi and spawn the tasks that keep it connected and serve on it.
 pub fn start(spawner: &Spawner, wifi: WIFI<'static>, ssid: &str, password: &str, board: &'static Shared) {
     let mut controller = WifiController::new(wifi, Default::default()).expect("Wi-Fi init");
@@ -62,16 +72,25 @@ pub fn start(spawner: &Spawner, wifi: WIFI<'static>, ssid: &str, password: &str,
     spawner.spawn(tcp_server(stack, board).expect("tcp task"));
 }
 
-/// Keep the station connected: retry every few seconds after a failure or a drop.
+/// Keep the station connected, retrying every few seconds after a failure or a drop, and sample the signal strength while it is.
 #[embassy_executor::task]
 async fn connection(mut controller: WifiController<'static>) {
     loop {
         match controller.connect_async().await {
             Ok(_) => {
                 println!("wifi: connected");
-                let _ = controller.wait_for_disconnect_async().await;
+                let sample = async {
+                    loop {
+                        if let Ok(r) = controller.rssi() {
+                            RSSI.store(r, Ordering::Relaxed);
+                        }
+                        Timer::after(Duration::from_secs(5)).await;
+                    }
+                };
+                let _ = embassy_futures::select::select(controller.wait_for_disconnect_async(), sample).await;
                 println!("wifi: disconnected");
                 ADDRESS.store(0, Ordering::Relaxed);
+                RSSI.store(0, Ordering::Relaxed);
             }
             Err(e) => {
                 // Just the reason: the whole error's Debug output costs ~2 KB of code.

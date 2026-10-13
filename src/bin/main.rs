@@ -2,8 +2,9 @@
 //!
 //! Line commands, the same on both links (numbers decimal, colour channels 0..=255):
 //! - `d hash` — followed by one frame: 172 × 320 RGB565 pixels, row by row, high byte first (110,080 bytes), checked against its BLAKE3 (64 hex digits), then drawn and kept in flash. Answers `ok d` or `err d …`
+//! - `g hash` — followed by the signal cells: twelve 30 × 13 RGB565 pictures, high byte first (9,360 bytes), of the dozenal digits Zil..Stelor each in its colour, checked against their BLAKE3 and kept in flash. Answers `ok g` or `err g …`. The board draws the cell for its own Wi-Fi signal over the frame's top-left corner, redrawn as the signal changes: Zil at −80 dBm or worse (or not connected) up to Stelor at −40 or better.
 //! - `b n` — backlight duty 0..=255, kept in flash
-//! - `info`, `ping`
+//! - `info` (backlight, signal strength in dBm or 0 when not connected, the signal cells' BLAKE3 as 16 hex digits or `-`, address), `ping`
 //!
 //! Over TCP (port 7766, `forecast.local`), the board first sends `hello <nonce>`, and nothing but `ping` works until the client answers `auth <BLAKE3 keyed with the shared key, of the nonce>`.
 //!
@@ -25,6 +26,7 @@ use c3_forecast::st7789::{HEIGHT, St7789, WIDTH};
 use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
+use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer, with_timeout};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
@@ -54,6 +56,29 @@ static FRAME: ConstStaticCell<Frame> = ConstStaticCell::new(Frame([0; FRAME_BYTE
 const STORE: u32 = 0x1D_0000;
 const STORE_DATA: u32 = STORE + FlashStorage::SECTOR_SIZE;
 const STORE_MAGIC: u32 = 0x4652_4D31;
+
+/// The signal cells (`g`), drawn at the panel's top-left: one per dozenal digit.
+const CELL_W: u16 = 30;
+const CELL_H: u16 = 13;
+const CELL_BYTES: usize = CELL_W as usize * CELL_H as usize * 2;
+const CELLS_BYTES: usize = 12 * CELL_BYTES;
+
+#[repr(C, align(4))]
+struct Cells([u8; CELLS_BYTES]);
+static CELLS: ConstStaticCell<Cells> = ConstStaticCell::new(Cells([0; CELLS_BYTES]));
+
+/// Kept in the `frame` partition after the frame, the same way: a header sector, then the data.
+const CELLS_STORE: u32 = STORE_DATA + (FRAME_BYTES as u32).div_ceil(FlashStorage::SECTOR_SIZE) * FlashStorage::SECTOR_SIZE;
+const CELLS_MAGIC: u32 = 0x5347_4E31;
+const _: () = assert!(CELLS_STORE + FlashStorage::SECTOR_SIZE + CELLS_BYTES as u32 <= STORE + 0x3_0000, "the cells must fit the frame partition");
+
+/// The signal digit for `rssi` (dBm): Zil at −80 or worse (or not connected) up to Stelor at −40 or better, evenly spaced in dB (about 3.6 dB a step).
+fn signal_digit(rssi: Option<i32>) -> u8 {
+    rssi.map_or(0, |r| (((r + 80).clamp(0, 40) * 11 + 20) / 40) as u8)
+}
+
+/// Wakes the signal task straight away, after a new frame has covered the cell.
+static REDRAW: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 /// Network, shared key and backlight, kept in the first sector of the `nvs` partition (nothing else here uses NVS).
 #[derive(Clone)]
@@ -113,39 +138,77 @@ struct Board {
     flash: FlashStorage<'static>,
     frame: &'static mut [u8; FRAME_BYTES],
     settings: Settings,
+    cells: &'static mut [u8; CELLS_BYTES],
+    /// The cells' BLAKE3, once a whole set is in RAM.
+    cells_hash: Option<[u8; 32]>,
+    /// Whether the panel shows a frame (not a test patch), so the signal cell belongs on it.
+    ribbon: bool,
+    /// The signal digit drawn now, if any.
+    cell: Option<u8>,
+}
+
+/// Keep `data` in flash at `at`: header sector (magic and BLAKE3) erased first, data written, header last, so a write cut short is never taken for whole.
+fn keep(flash: &mut FlashStorage, at: u32, magic: u32, hash: [u8; 32], data: &[u8]) -> bool {
+    let mut header = [0u32; 9];
+    header[0] = magic;
+    for (i, w) in hash.chunks_exact(4).enumerate() {
+        header[1 + i] = u32::from_le_bytes(w.try_into().unwrap());
+    }
+    // SAFETY: the u32 array viewed as its bytes, word-aligned as the ROM write needs.
+    let header = unsafe { core::slice::from_raw_parts(header.as_ptr() as *const u8, 36) };
+    let data_at = at + FlashStorage::SECTOR_SIZE;
+    let end = data_at + (data.len() as u32).div_ceil(FlashStorage::SECTOR_SIZE) * FlashStorage::SECTOR_SIZE;
+    flash.erase(at, end).is_ok() && flash.write_nor(data_at, data).is_ok() && flash.write_nor(at, header).is_ok()
+}
+
+/// Read back what `keep` wrote at `at` into `data`: its BLAKE3, if the header is there and the data matches it.
+fn load(flash: &mut FlashStorage, at: u32, magic: u32, data: &mut [u8]) -> Option<[u8; 32]> {
+    let mut header = [0u32; 9];
+    // SAFETY: as in `keep`.
+    let bytes = unsafe { core::slice::from_raw_parts_mut(header.as_mut_ptr() as *mut u8, 36) };
+    if flash.read_nor(at, bytes).is_err() || header[0] != magic || flash.read_nor(at + FlashStorage::SECTOR_SIZE, data).is_err() {
+        return None;
+    }
+    let hash: [u8; 32] = bytes[4..36].try_into().unwrap();
+    (blake3::hash(data).as_bytes() == &hash).then_some(hash)
 }
 
 type Shared = Mutex<CriticalSectionRawMutex, Board>;
 static BOARD: StaticCell<Shared> = StaticCell::new();
 
 impl Board {
+    /// Draw the frame buffer, then have the signal task put its cell back on top.
     fn draw(&mut self) {
         self.lcd.begin(0, 0, WIDTH, HEIGHT);
         self.lcd.push(&self.frame[..]);
+        self.cell = None;
+        REDRAW.signal(());
     }
 
-    /// Keep the frame in flash: header erased first, data written, header last.
+    /// Keep the frame in flash.
     fn persist(&mut self, hash: [u8; 32]) -> bool {
-        let mut header = [0u32; 9];
-        header[0] = STORE_MAGIC;
-        for (i, w) in hash.chunks_exact(4).enumerate() {
-            header[1 + i] = u32::from_le_bytes(w.try_into().unwrap());
-        }
-        // SAFETY: the u32 array viewed as its bytes, word-aligned as the ROM write needs.
-        let header = unsafe { core::slice::from_raw_parts(header.as_ptr() as *const u8, 36) };
-        let data_end = STORE_DATA + (FRAME_BYTES as u32).div_ceil(FlashStorage::SECTOR_SIZE) * FlashStorage::SECTOR_SIZE;
-        self.flash.erase(STORE, data_end).is_ok() && self.flash.write_nor(STORE_DATA, &self.frame[..]).is_ok() && self.flash.write_nor(STORE, header).is_ok()
+        keep(&mut self.flash, STORE, STORE_MAGIC, hash, &self.frame[..])
     }
 
-    /// The kept frame, if its header is there and its BLAKE3 matches.
+    /// The kept frame, if it's there whole.
     fn restore(&mut self) -> bool {
-        let mut header = [0u32; 9];
-        // SAFETY: as in `persist`.
-        let bytes = unsafe { core::slice::from_raw_parts_mut(header.as_mut_ptr() as *mut u8, 36) };
-        if self.flash.read_nor(STORE, bytes).is_err() || header[0] != STORE_MAGIC || self.flash.read_nor(STORE_DATA, &mut self.frame[..]).is_err() {
-            return false;
+        load(&mut self.flash, STORE, STORE_MAGIC, &mut self.frame[..]).is_some()
+    }
+
+    /// The kept signal cells, if they're there whole.
+    fn restore_cells(&mut self) {
+        self.cells_hash = load(&mut self.flash, CELLS_STORE, CELLS_MAGIC, &mut self.cells[..]);
+    }
+
+    /// Draw the cell for signal `digit` over the frame's top-left corner, unless it's there already (or there's no frame or no cells).
+    fn show_signal(&mut self, digit: u8) {
+        if !self.ribbon || self.cells_hash.is_none() || self.cell == Some(digit) {
+            return;
         }
-        blake3::hash(&self.frame[..]).as_bytes()[..] == bytes[4..36]
+        let at = digit as usize * CELL_BYTES;
+        self.lcd.begin(0, 0, CELL_W, CELL_H);
+        self.lcd.push(&self.cells[at..at + CELL_BYTES]);
+        self.cell = Some(digit);
     }
 
     /// Fill the panel with black and an s×s square of one colour at its centre (s = 0: all black; s ≥ 172: the whole panel).
@@ -162,7 +225,18 @@ impl Board {
                 self.frame[i + 1] = p as u8;
             }
         }
+        self.ribbon = false;
         self.draw();
+    }
+}
+
+/// Keep the signal cell on the frame matching the board's own Wi-Fi signal: checked every second, and straight after each new frame.
+#[embassy_executor::task]
+async fn signal(board: &'static Shared) {
+    loop {
+        let digit = signal_digit(net::rssi());
+        board.lock().await.show_signal(digit);
+        let _ = with_timeout(Duration::from_secs(1), REDRAW.wait()).await;
     }
 }
 
@@ -199,17 +273,19 @@ async fn main(spawner: Spawner) -> ! {
     let mut flash = FlashStorage::new(peripherals.FLASH);
     let settings = Settings::load(&mut flash);
     let wifi = settings.clone();
-    let board = BOARD.init(Mutex::new(Board { lcd, io, flash, frame: &mut FRAME.take().0, settings }));
+    let board = BOARD.init(Mutex::new(Board { lcd, io, flash, frame: &mut FRAME.take().0, settings, cells: &mut CELLS.take().0, cells_hash: None, ribbon: true, cell: None }));
     {
         let mut b = board.lock().await;
         if !b.restore() {
             b.frame.fill(0);
         }
+        b.restore_cells();
         b.draw();
         let duty = b.settings.backlight;
         b.io.backlight(duty);
     }
     println!("LCD up: {WIDTH}x{HEIGHT}");
+    spawner.spawn(signal(board).expect("signal task"));
     if wifi.ssid.is_empty() {
         println!("no Wi-Fi network set: `wifi <ssid> <password>` over USB");
     } else {
@@ -398,6 +474,10 @@ async fn serve(conn: &mut Conn<'_, '_>, board: &'static Shared, usb: bool) -> Re
                 Some(hash) => receive_frame(conn, board, hash).await?,
                 None => conn.reply(format_args!("err d <blake3>")).await?,
             },
+            "g" => match words.next().and_then(unhex32) {
+                Some(hash) => receive_cells(conn, board, hash).await?,
+                None => conn.reply(format_args!("err g <blake3>")).await?,
+            },
             "b" => match numbers::<1>(words) {
                 Some((a, 1)) if a[0] <= 255 => {
                     let mut b = board.lock().await;
@@ -411,9 +491,21 @@ async fn serve(conn: &mut Conn<'_, '_>, board: &'static Shared, usb: bool) -> Re
                 _ => conn.reply(format_args!("err {text}")).await?,
             },
             "info" => {
-                let b = board.lock().await.settings.backlight;
+                let (b, cells) = {
+                    let b = board.lock().await;
+                    (b.settings.backlight, b.cells_hash)
+                };
+                let mut c = heapless::String::<16>::new();
+                match cells {
+                    Some(h) => {
+                        let _ = write!(c, "{}", Hex(&h[..8]));
+                    }
+                    None => {
+                        let _ = c.push('-');
+                    }
+                }
                 let ip = net::address();
-                conn.reply(format_args!("ok info backlight {b} ip {}", ip.map_or(heapless::String::<16>::new(), |a| {
+                conn.reply(format_args!("ok info backlight {b} rssi {} cells {c} ip {}", net::rssi().unwrap_or(0), ip.map_or(heapless::String::<16>::new(), |a| {
                     let mut s = heapless::String::new();
                     let _ = write!(s, "{a}");
                     s
@@ -489,8 +581,36 @@ async fn receive_frame(conn: &mut Conn<'_, '_>, board: &'static Shared, hash: [u
         drop(b);
         return conn.reply(format_args!("err d hash mismatch")).await;
     }
+    b.ribbon = true;
     b.draw();
     let kept = b.persist(hash);
     drop(b);
     conn.reply(format_args!("{} d", if kept { "ok" } else { "err" })).await
+}
+
+/// `g hash`: read the signal cells into RAM, check their BLAKE3, keep them in flash and redraw the cell. Cells that arrive damaged or short are dropped for the kept ones.
+async fn receive_cells(conn: &mut Conn<'_, '_>, board: &'static Shared, hash: [u8; 32]) -> Result<(), ()> {
+    let mut guard = board.lock().await;
+    let b = &mut *guard;
+    b.cells_hash = None;
+    let problem = match with_timeout(Duration::from_secs(20), conn.read_exact(&mut b.cells[..])).await {
+        Ok(Ok(())) if blake3::hash(&b.cells[..]) == blake3::Hash::from_bytes(hash) => None,
+        Ok(Ok(())) => Some("hash mismatch"),
+        Ok(Err(())) => {
+            b.restore_cells();
+            return Err(());
+        }
+        Err(_) => Some("stalled"),
+    };
+    if let Some(problem) = problem {
+        b.restore_cells();
+        drop(guard);
+        return conn.reply(format_args!("err g {problem}")).await;
+    }
+    b.cells_hash = Some(hash);
+    let kept = keep(&mut b.flash, CELLS_STORE, CELLS_MAGIC, hash, &b.cells[..]);
+    b.cell = None;
+    drop(guard);
+    REDRAW.signal(());
+    conn.reply(format_args!("{} g", if kept { "ok" } else { "err" })).await
 }
