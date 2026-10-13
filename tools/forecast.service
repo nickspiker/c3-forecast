@@ -1,0 +1,16 @@
+[Unit]
+Description=Forecast ribbon on the ESP32-C3 LCD
+Wants=network-online.target
+After=network-online.target
+RequiresMountsFor=/mnt/Harbor/Code
+
+[Service]
+# Started through /usr/bin/env: /mnt/Harbor carries no SELinux labels, and systemd may only start labelled executables; env (bin_t) then runs the binary, as python3 once ran the scripts.
+User=nick
+WorkingDirectory=/mnt/Harbor/Code/c3-forecast/tools/forecast
+ExecStart=/usr/bin/env /mnt/Harbor/Code/c3-forecast/tools/forecast/target/x86_64-unknown-linux-gnu/release/forecast run
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

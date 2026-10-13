@@ -1,0 +1,5 @@
+Oxanium-Regular+glyphs.ttf — Oxanium Regular with the twelve Stelor-system dozenal glyphs (Zil..Stelor) added at U+0010..U+001B. Copied from photon (assets/Oxanium).
+
+Copyright 2019 The Oxanium Project Authors (https://github.com/sevmeyer/oxanium)
+
+This Font Software is licensed under the SIL Open Font License, Version 1.1. This license is available with a FAQ at: https://scripts.sil.org/OFL

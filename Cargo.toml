@@ -1,0 +1,46 @@
+[package]
+edition      = "2024"
+name         = "c3-forecast"
+rust-version = "1.95"
+version      = "0.1.0"
+autobins     = false
+
+[[bin]]
+name = "c3-forecast"
+path = "./src/bin/main.rs"
+
+[dependencies]
+esp-hal = { version = "~1.2.2", features = ["esp32c3", "unstable"] }
+esp-rtos = { version = "0.4.0", features = ["embassy", "esp32c3", "esp-radio", "esp-alloc"] }
+esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32c3"] }
+embassy-executor = { version = "0.10.0", features = [] }
+embassy-time = "0.5.0"
+esp-backtrace = { version = "0.20.0", features = ["esp32c3", "panic-handler", "println"] }
+esp-println = { version = "0.18.0", features = ["esp32c3"] }
+critical-section = "1.2.0"
+static_cell = "2.1.1"
+esp-storage = { version = "0.10.0", features = ["esp32c3"] }
+blake3 = { version = "1", default-features = false }
+esp-radio = { version = "=1.0.0-beta.1", features = ["esp32c3", "wifi", "unstable"] }
+esp-alloc = { version = "0.11", features = ["esp32c3"] }
+embassy-net = { version = "0.9", default-features = false, features = ["tcp", "udp", "dhcpv4", "dhcpv4-hostname", "medium-ethernet", "proto-ipv4", "multicast"] }
+embassy-sync = "0.8"
+edge-mdns = "0.8"
+edge-nal-embassy = { version = "0.9", default-features = false, features = ["proto-ipv4", "medium-ethernet", "udp", "multicast"] }
+edge-nal = "0.7"
+embedded-io-async = "0.7"
+embassy-futures = "0.1"
+heapless = "0.9"
+
+[profile.dev]
+opt-level = "s"
+
+[profile.release]
+codegen-units = 1
+debug         = 2
+lto           = 'fat'
+opt-level     = 's'
+
+# The radio blobs need optimisation to work (esp-radio's docs: opt-level 2 or 3).
+[profile.release.package.esp-radio]
+opt-level = 3

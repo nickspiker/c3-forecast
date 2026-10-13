@@ -1,0 +1,3 @@
+# The firmware crate's .cargo/config.toml targets the ESP32-C3; this host tool builds for the PC.
+[build]
+target = "x86_64-unknown-linux-gnu"

@@ -1,0 +1,34 @@
+LCD characterisation, VSF colorimetry (SS2000 10° cones, Illuminant E)  —  /mnt/Harbor/Code/c3-forecast/measurements/i1pro-2026-10-12
+
+PRIMARIES (full drive, minus the black reading)
+  red    peak   607 nm  FWHM   57 nm   α 0.7350 β 0.1936 γ 0.3318   share of white's photopic  11.9 %
+  green  peak   547 nm  FWHM   70 nm   α 0.4724 β 0.0373 γ 1.0706   share of white's photopic  65.9 %
+  blue   peak   450 nm  FWHM   23 nm   α 0.3618 β 0.8545 γ 0.1553   share of white's photopic  21.4 %
+  additivity: white / (R+G+B) per cone  L 1.008  M 1.008  S 1.007   photopic 1.008
+
+GAMUT: each primary in Rec.2020 (VSF, wavelength-defined) linear RGB, normalised to its largest component
+  red    (+1.000, +0.114, +0.033)
+  green  (+0.310, +1.000, +0.022)
+  blue   (+0.091, -0.102, +1.000)
+
+BLACK (the backlight's leak at all-black drive, backlight full)
+  photopic 0.0010 of white  (contrast 1015:1)   peak 447 nm   α 0.4510 β 0.7207 γ 0.2940
+
+RESPONSE: fraction of full drive by code (minus black), and the power-law exponent fitted over codes 16–255
+  code         4      8     16     32     64     96    128    160    192    224    255
+  red     0.0000 0.0002 0.0006 0.0026 0.0098 0.0224 0.0522 0.1232 0.2810 0.6015 1.0001   γ 2.78
+  green   0.0001 0.0001 0.0005 0.0025 0.0095 0.0220 0.0466 0.1083 0.2545 0.5395 1.0000   γ 2.74
+  blue    0.0000 0.0002 0.0006 0.0025 0.0096 0.0221 0.0514 0.1217 0.2805 0.6059 1.0000   γ 2.80
+  white photopic γ 2.63
+
+BACKLIGHT: PWM duty → white and black photopic (relative to duty 255), contrast
+  duty 255: white  1.0000  black 0.00099  contrast  1015:1   white α 0.4722 β 0.6320 γ 0.3828
+  duty 191: white  0.7512  black 0.00072  contrast  1047:1   white α 0.4727 β 0.6315 γ 0.3831
+  duty 127: white  0.5006  black 0.00047  contrast  1065:1   white α 0.4733 β 0.6309 γ 0.3834
+  duty  63: white  0.2491  black 0.00023  contrast  1061:1   white α 0.4739 β 0.6302 γ 0.3839
+  duty  31: white  0.1234  black 0.00012  contrast  1041:1   white α 0.4744 β 0.6295 γ 0.3844
+  duty  15: white  0.0604  black 0.00005  contrast  1229:1   white α 0.4748 β 0.6288 γ 0.3849
+  duty   7: white  0.0289  black 0.00003  contrast   889:1   white α 0.4751 β 0.6282 γ 0.3854
+  duty   3: white  0.0131  black -0.00001  contrast 114834955:1   white α 0.4751 β 0.6276 γ 0.3860
+  duty   1: white  0.0051  black -0.00002  contrast 44708837:1   white α 0.4753 β 0.6271 γ 0.3864
+  white vs duty, power-law exponent 0.96 (1.00 = light proportional to duty)
