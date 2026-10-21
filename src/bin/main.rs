@@ -11,6 +11,8 @@
 //! USB only:
 //! - `wifi <ssid> <password>` — store the network to join and restart; `key <64 hex digits>` — store the shared key; `net` — report the board's address
 //! - `f r g b` — fill the whole panel; `w s r g b` — an s×s square (s ≤ 172) centred on black; both answered once drawn. The next frame replaces them.
+//!
+//! BOOT (GPIO9), once released, switches the board to simulon (the ball table, in the other app slot: see partitions.csv) and restarts into it; BOOT there switches back.
 
 #![no_std]
 #![no_main]
@@ -31,7 +33,9 @@ use embassy_time::{Duration, Timer, with_timeout};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::delay::Delay;
-use esp_hal::gpio::{Level, Output, OutputConfig};
+use esp_bootloader_esp_idf::ota_updater::OtaUpdater;
+use esp_bootloader_esp_idf::partitions::{AppPartitionSubType, PARTITION_TABLE_MAX_LEN};
+use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
 use esp_hal::i2c::master::{Config as I2cConfig, I2c};
 use esp_hal::spi::Mode;
 use esp_hal::spi::master::{Config as SpiConfig, Spi};
@@ -230,6 +234,25 @@ impl Board {
     }
 }
 
+/// BOOT, once released: have the bootloader start simulon (app slot 1) from now on, and restart into it. On release, since restarting with BOOT still held would land in the ROM's download mode.
+#[embassy_executor::task]
+async fn boot_button(pin: Input<'static>, board: &'static Shared) {
+    loop {
+        while pin.is_high() {
+            Timer::after(Duration::from_millis(20)).await;
+        }
+        while pin.is_low() {
+            Timer::after(Duration::from_millis(20)).await;
+        }
+        let mut b = board.lock().await;
+        let mut table = [0; PARTITION_TABLE_MAX_LEN];
+        match OtaUpdater::new(&mut b.flash, &mut table).and_then(|mut ota| ota.ota_data()?.set_current_app_partition(AppPartitionSubType::Ota1)) {
+            Ok(()) => esp_hal::system::software_reset(),
+            Err(e) => println!("can't switch to simulon: {e:?}"),
+        }
+    }
+}
+
 /// Keep the signal cell on the frame matching the board's own Wi-Fi signal: checked every second, and straight after each new frame.
 #[embassy_executor::task]
 async fn signal(board: &'static Shared) {
@@ -286,6 +309,7 @@ async fn main(spawner: Spawner) -> ! {
     }
     println!("LCD up: {WIDTH}x{HEIGHT}");
     spawner.spawn(signal(board).expect("signal task"));
+    spawner.spawn(boot_button(Input::new(peripherals.GPIO9, InputConfig::default().with_pull(Pull::Up)), board).expect("boot button task"));
     if wifi.ssid.is_empty() {
         println!("no Wi-Fi network set: `wifi <ssid> <password>` over USB");
     } else {

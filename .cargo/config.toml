@@ -2,7 +2,7 @@
 include = ["esp-config.toml"]
 
 [target.riscv32imc-unknown-none-elf]
-runner = "espflash flash --monitor --chip esp32c3 --flash-size 4mb --partition-table partitions.csv"
+runner = "espflash flash --monitor --chip esp32c3 --flash-size 4mb --partition-table partitions.csv --target-app-partition forecast"
 
 [build]
 rustflags = [

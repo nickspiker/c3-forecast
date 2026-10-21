@@ -1,5 +1,8 @@
+# Shared with c3-forecast (keep the two identical): the forecast in ota_0, simulon in ota_1, and BOOT in either switches to the other. The forecast's settings (first sector of nvs) and kept frame (frame) stay where they always were.
 # Name,   Type, SubType,   Offset,   Size
-nvs,      data, nvs,       0x9000,   0x6000
+nvs,      data, nvs,       0x9000,   0x4000
+otadata,  data, ota,       0xd000,   0x2000
 phy_init, data, phy,       0xf000,   0x1000
-factory,  app,  factory,   0x10000,  0x1C0000
+forecast, app,  ota_0,     0x10000,  0x1C0000
 frame,    data, undefined, 0x1D0000, 0x30000
+simulon,  app,  ota_1,     0x200000, 0x100000
